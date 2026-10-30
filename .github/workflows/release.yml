@@ -1,0 +1,234 @@
+name: release
+
+# Standard PiLAB Go release: build → package (deb + rpm) → GitHub release →
+# publish to https://dl.pilab.hu → install test against the published repo.
+#
+#   name: Release
+#   on:
+#     push:
+#       tags: ['v*']
+#   jobs:
+#     release:
+#       uses: pilab-dev/release-toolchain/.github/workflows/release.yml@v1
+#       with:
+#         description: 'WireGuard mesh manager'
+#       secrets: inherit
+#
+# Without a .goreleaser.yaml in the repository the shared config in
+# templates/goreleaser.yaml is rendered through templates/render.sh, so new
+# projects package identically. Repositories that need extra packaging
+# (systemd units, conffiles, dependencies) keep their own .goreleaser.yaml and
+# pass `config: repo`.
+
+on:
+  workflow_call:
+    inputs:
+      binary:
+        description: 'Binary and archive name. Defaults to the repository name.'
+        type: string
+        default: ''
+      package:
+        description: 'deb/rpm package name. Defaults to the repository name.'
+        type: string
+        default: ''
+      main:
+        description: 'Main package path'
+        type: string
+        default: '.'
+      description:
+        description: 'One-line package description'
+        type: string
+        default: ''
+      go-version:
+        description: 'Go toolchain version'
+        type: string
+        default: 'stable'
+      arches:
+        description: 'GOARCH list for the standard config'
+        type: string
+        default: 'amd64 arm64 386'
+      ldflags-package:
+        description: 'Package holding version/commit/date vars. Use "none" to skip -X flags.'
+        type: string
+        default: 'main'
+      config:
+        description: 'standard = render the shared config, repo = use the repository .goreleaser.yaml'
+        type: string
+        default: ''
+      toolchain-ref:
+        description: 'Ref of pilab-dev/release-toolchain to render the config from. Keep it in step with the @ref this workflow is called at (and with the sync-dl ref pinned inside this file).'
+        type: string
+        default: 'v1'
+      tier:
+        description: 'Tier the packages are published to'
+        type: string
+        default: testing
+      sync:
+        description: 'Publish the release to dl.pilab.hu'
+        type: boolean
+        default: true
+      install-test:
+        description: 'Install the package from the published repository'
+        type: boolean
+        default: true
+      install-package:
+        description: 'Package name for the install test. Defaults to the package input.'
+        type: string
+        default: ''
+    secrets:
+      DL_SSH_KEY:
+        required: false
+      DL_SSH_HOST:
+        required: false
+      DL_SSH_USER:
+        required: false
+      DL_SSH_PORT:
+        required: false
+      GH_TOKEN:
+        description: 'Token for private Go modules and vendor organisations'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    name: build and release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      package: ${{ steps.meta.outputs.package }}
+    env:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Choose GoReleaser config
+        id: config
+        env:
+          CONFIG: ${{ inputs.config }}
+        run: |
+          set -euo pipefail
+          mode="$CONFIG"
+          if [ -z "$mode" ]; then
+            if compgen -G ".goreleaser.y*ml" >/dev/null; then mode=repo; else mode=standard; fi
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "using $mode config"
+          # GoReleaser refuses to release from a dirty tree, and a generated
+          # .goreleaser.yaml left in the checkout would make it dirty, so the
+          # effective config always lives outside the checkout and is passed
+          # with --config.
+          echo "path=$RUNNER_TEMP/pilab-goreleaser.yaml" >> "$GITHUB_OUTPUT"
+
+      # Only needed to render the standard config; skip it for repositories
+      # that ship their own .goreleaser.yaml.
+      - name: Check out the toolchain
+        if: steps.config.outputs.mode == 'standard'
+        uses: actions/checkout@v4
+        with:
+          repository: pilab-dev/release-toolchain
+          ref: ${{ inputs.toolchain-ref }}
+          path: .toolchain
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: true
+
+      - name: Private modules
+        if: env.GH_TOKEN != ''
+        run: |
+          git config --global url."https://$GH_TOKEN@github.com/".insteadOf "https://github.com/"
+          go env -w GOPRIVATE=go.pilab.hu
+
+      - name: Resolve names
+        id: meta
+        env:
+          BINARY: ${{ inputs.binary || github.event.repository.name }}
+          PACKAGE: ${{ inputs.package || inputs.binary || github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          echo "binary=$BINARY" >> "$GITHUB_OUTPUT"
+          echo "package=$PACKAGE" >> "$GITHUB_OUTPUT"
+          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          # A package version that does not derive from the tag never upgrades,
+          # so reject anything that is not vX.Y.Z up front.
+          if [[ ! $GITHUB_REF_NAME =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$ ]]; then
+            echo "::error::tag $GITHUB_REF_NAME is not vX.Y.Z; package versions must be comparable"
+            exit 1
+          fi
+
+      - name: Render the standard config
+        if: steps.config.outputs.mode == 'standard'
+        env:
+          BINARY: ${{ inputs.binary || github.event.repository.name }}
+          PACKAGE: ${{ inputs.package || inputs.binary || github.event.repository.name }}
+          MAIN: ${{ inputs.main }}
+          DESCRIPTION: ${{ inputs.description || github.event.repository.description }}
+          ARCHES: ${{ inputs.arches }}
+          LDPKG: ${{ inputs.ldflags-package }}
+          REPO: ${{ github.repository }}
+          OUT: ${{ steps.config.outputs.path }}
+        # Drop the second checkout again: it would leave the working tree
+        # dirty, and GoReleaser refuses to release from a dirty tree.
+        run: |
+          .toolchain/templates/render.sh
+          rm -rf .toolchain
+
+      - name: Use the repository config
+        if: steps.config.outputs.mode == 'repo'
+        env:
+          OUT: ${{ steps.config.outputs.path }}
+        run: cp .goreleaser.yaml "$OUT"
+
+      - name: Validate config
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: check --config ${{ steps.config.outputs.path }}
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean --config ${{ steps.config.outputs.path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+
+  sync:
+    name: publish
+    needs: [goreleaser]
+    if: inputs.sync
+    # Full path, never `./`: a `./` inside a reusable workflow resolves against
+    # the *caller's* repository, and consumers do not have this file. `uses:`
+    # takes no expressions, so the ref is pinned - keep it in step with the
+    # @ref this workflow itself is called at and with toolchain-ref.
+    uses: pilab-dev/release-toolchain/.github/workflows/sync-dl.yml@v1
+    with:
+      source: artifact
+      artifact-name: packages
+      tier: ${{ inputs.tier }}
+      repo: ${{ github.repository }}
+      tag: ${{ needs.goreleaser.outputs.tag }}
+      install-test: ${{ inputs.install-test }}
+      install-package: ${{ inputs.install-package || needs.goreleaser.outputs.package }}
+    secrets:
+      DL_SSH_KEY: ${{ secrets.DL_SSH_KEY }}
+      DL_SSH_HOST: ${{ secrets.DL_SSH_HOST }}
+      DL_SSH_USER: ${{ secrets.DL_SSH_USER }}
+      DL_SSH_PORT: ${{ secrets.DL_SSH_PORT }}

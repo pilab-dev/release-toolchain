@@ -1,0 +1,57 @@
+# PiLAB standard GoReleaser configuration.
+#
+# Rendered by pilab-dev/release-toolchain/.github/workflows/release.yml with the
+# __PLACEHOLDERS__ substituted. Keep it copy-pasteable: a repository that needs
+# extra packaging (systemd units, conffiles, dependencies) can copy this file to
+# .goreleaser.yaml, extend it, and call the workflow with `config: repo`.
+version: 2
+
+project_name: __BINARY__
+
+builds:
+  - id: __BINARY__
+    main: __MAIN__
+    binary: __BINARY__
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch: [__ARCHES__]
+    ldflags: [__LDFLAGS__]
+
+archives:
+  - id: __BINARY__
+    ids: [__BINARY__]
+    formats: [tar.gz]
+    name_template: "__BINARY___{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+nfpms:
+  - id: __BINARY__
+    package_name: __PACKAGE__
+    ids: [__BINARY__]
+    vendor: Progressive Innovation LAB
+    homepage: "https://github.com/__REPO__"
+    maintainer: Paal Gyula <gyula@pilab.hu>
+    description: "__DESCRIPTION__"
+    license: Proprietary
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    # The repository serves these two layouts; archlinux is deliberately absent
+    # because dl.pilab.hu does not publish an Arch tree.
+    overrides:
+      deb:
+        file_name_template: "{{ .PackageName }}_{{ .Version }}_{{ .Arch }}"
+      rpm:
+        file_name_template: "{{ .PackageName }}-{{ .Version }}-linux-{{ .Arch }}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"

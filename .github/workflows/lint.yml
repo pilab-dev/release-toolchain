@@ -1,0 +1,77 @@
+name: lint
+
+# CI for the toolchain itself: a broken workflow here breaks every consumer's
+# release, so this must be stricter than what it asks of consumers.
+on:
+  push:
+  pull_request:
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download actionlint
+        run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+
+      - name: Lint workflows
+        run: ./actionlint -color
+
+      - name: Reusable workflows must not use local ./ references
+        # `./` inside a reusable workflow resolves against the *consumer's*
+        # repository, where these files do not exist. Every reference must be
+        # owner/repo/path@ref.
+        run: |
+          set -euo pipefail
+          if grep -rnE '^[[:space:]]*uses:[[:space:]]*\./' .github/workflows/; then
+            echo "::error::local ./ reference in a reusable workflow; use owner/repo/.github/workflows/x.yml@ref"
+            exit 1
+          fi
+          echo "all workflow references are absolute"
+
+      - name: The template must render
+        env:
+          BINARY: sample
+          PACKAGE: sample
+          MAIN: .
+          DESCRIPTION: 'Sample description for the render check'
+          ARCHES: 'amd64 arm64 386'
+          LDPKG: main
+          REPO: pilab-dev/release-toolchain
+          OUT: rendered-config.yaml
+        run: bash templates/render.sh
+
+      - name: An unrendered placeholder must fail
+        env:
+          BINARY: sample
+          TEMPLATE: templates/render.yaml-with-placeholder
+          OUT: placeholder-test.yaml
+        # Prove the guard in render.sh really trips, not just that it is quiet.
+        run: |
+          set -euo pipefail
+          printf 'name: __MISSING__\n' > templates/render.yaml-with-placeholder
+          if bash templates/render.sh; then
+            echo "::error::render.sh accepted an unrendered placeholder"
+            exit 1
+          fi
+          echo "guard trips as expected"
+
+      - name: Check the rendered config with GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: check --config rendered-config.yaml
+
+      - name: The GoReleaser config must parse as YAML
+        run: python3 -c "import yaml,sys; yaml.safe_load(open('rendered-config.yaml')); print('valid yaml')"
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Lint the render script
+        run: shellcheck templates/render.sh

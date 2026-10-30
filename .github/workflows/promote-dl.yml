@@ -1,0 +1,94 @@
+name: promote-dl
+
+# Move a package between tiers (testing → stable) on the published repository.
+#
+#   jobs:
+#     promote:
+#       uses: pilab-dev/release-toolchain/.github/workflows/promote-dl.yml@v1
+#       with:
+#         package: pivirt-agent
+#       secrets: inherit
+#
+# The builder copies the package into the target tier's corpus, re-indexes and
+# re-signs that tier, then publishes. Nothing is rebuilt from source, so the
+# promoted artifact is byte-identical to the one that was tested.
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: 'Package name to promote'
+        type: string
+        required: true
+      type:
+        description: 'deb or rpm'
+        type: string
+        default: deb
+      from:
+        description: 'Source tier'
+        type: string
+        default: testing
+      to:
+        description: 'Target tier'
+        type: string
+        default: stable
+    secrets:
+      DL_SSH_KEY:
+        required: true
+      DL_SSH_HOST:
+        required: true
+      DL_SSH_USER:
+        required: true
+      DL_SSH_PORT:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send the request
+        env:
+          SSH_KEY: ${{ secrets.DL_SSH_KEY }}
+          SSH_HOST: ${{ secrets.DL_SSH_HOST }}
+          SSH_USER: ${{ secrets.DL_SSH_USER }}
+          SSH_PORT: ${{ secrets.DL_SSH_PORT || 22 }}
+          PKG: ${{ inputs.package }}
+          TYPE: ${{ inputs.type }}
+          FROM: ${{ inputs.from }}
+          TO: ${{ inputs.to }}
+        run: |
+          set -euo pipefail
+          case "$TYPE" in deb|rpm) ;; *) echo "::error::invalid type $TYPE"; exit 1 ;; esac
+          case "$FROM$TO" in
+            testingstable|stabletesting) ;;
+            *) echo "::error::unsupported promotion $FROM -> $TO"; exit 1 ;;
+          esac
+          if [[ ! $PKG =~ ^[A-Za-z0-9][A-Za-z0-9._+~-]*$ ]]; then
+            echo "::error::invalid package name $PKG"; exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/dl_key
+          chmod 600 ~/.ssh/dl_key
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          SSH_OPTS=(-i ~/.ssh/dl_key -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes)
+
+          id="$(date -u +%Y%m%dT%H%M%SZ)-promote-${PKG}-${GITHUB_RUN_ID}"
+          mkdir -p req
+          jq -n --arg a promote --arg t "$TYPE" --arg f "$FROM" --arg o "$TO" --arg n "$PKG" \
+            '{action:$a, type:$t, from:$f, to:$o, name:$n}' > "req/$id.json"
+          rsync -a -e "ssh ${SSH_OPTS[*]}" "req/$id.json" "$SSH_USER@$SSH_HOST:requests/$id.json"
+
+          for _ in $(seq 1 90); do
+            out="$(ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "cat dl-inbox/status/$id.json" 2>/dev/null || true)"
+            case "$out" in *'"status"'*) break ;; esac
+            out=''
+            sleep 10
+          done
+          [ -n "$out" ] || { echo "::error::promotion timed out"; exit 1; }
+          echo "$out"
+          [ "$(echo "$out" | jq -r .status)" = ok ] || { echo "::error::promotion failed"; exit 1; }
+          echo "promoted $PKG ($TYPE) $FROM -> $TO"

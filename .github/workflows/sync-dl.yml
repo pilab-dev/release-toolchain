@@ -1,0 +1,327 @@
+name: sync-dl
+
+# Publish an already-built release to https://dl.pilab.hu.
+#
+# The job uploads the .deb/.rpm assets into the builder's CI inbox, the
+# repository agent on the builder re-indexes and signs the tier, publishes the
+# tree, and writes a result file the job waits for. The workflow then verifies
+# the artifacts over HTTPS and (optionally) installs the package from the
+# published repository in a throwaway container.
+#
+# Nothing here holds a signing key: the key never leaves the builder, and the
+# deploy key can only write into the inbox (see dl-ssh-gate).
+
+on:
+  workflow_call:
+    inputs:
+      source:
+        description: 'release = download assets from a GitHub release, artifact = use an uploaded artifact'
+        type: string
+        default: release
+      tag:
+        description: 'Release tag (source=release). Defaults to the caller ref name.'
+        type: string
+        default: ''
+      artifact-name:
+        description: 'Artifact holding the packages (source=artifact)'
+        type: string
+        default: packages
+      tier:
+        description: 'Target tier: testing or stable'
+        type: string
+        default: testing
+      repo:
+        description: 'owner/name recorded as provenance. Defaults to the caller repository.'
+        type: string
+        default: ''
+      dl-base-url:
+        description: 'Public base URL of the repository'
+        type: string
+        default: 'https://dl.pilab.hu'
+      install-test:
+        description: 'Install the package from the published repository in a container'
+        type: boolean
+        default: true
+      install-package:
+        description: 'Package name for the install test. Defaults to the repository name.'
+        type: string
+        default: ''
+      timeout-minutes:
+        description: 'How long to wait for the builder to apply the job'
+        type: number
+        default: 20
+    secrets:
+      DL_SSH_KEY:
+        required: true
+      DL_SSH_HOST:
+        required: true
+      DL_SSH_USER:
+        required: true
+      DL_SSH_PORT:
+        required: false
+    outputs:
+      job-id:
+        description: 'Inbox job id'
+        value: ${{ jobs.sync.outputs.job-id }}
+      tier:
+        description: 'Tier the packages landed in'
+        value: ${{ jobs.sync.outputs.tier }}
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: publish to dl.pilab.hu (${{ inputs.tier }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    outputs:
+      job-id: ${{ steps.upload.outputs.job-id }}
+      tier: ${{ inputs.tier }}
+    steps:
+      - name: Check inputs
+        env:
+          TIER: ${{ inputs.tier }}
+          SOURCE: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+          case "$TIER" in
+            testing|stable) ;;
+            *) echo "::error::invalid tier '$TIER'"; exit 1 ;;
+          esac
+          case "$SOURCE" in
+            release|artifact) ;;
+            *) echo "::error::invalid source '$SOURCE'"; exit 1 ;;
+          esac
+
+      - name: Download release assets
+        if: inputs.source == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "downloading .deb/.rpm assets of $TAG"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.deb' --pattern '*.rpm' --dir pkgs --clobber
+
+      - name: Download build artifact
+        if: inputs.source == 'artifact'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: pkgs
+
+      - name: Check packages
+        id: check
+        run: |
+          set -euo pipefail
+          shopt -s nullglob globstar
+          files=(pkgs/**/*.deb pkgs/**/*.rpm)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no .deb or .rpm artifacts found"
+            exit 1
+          fi
+          mkdir -p out
+          for f in "${files[@]}"; do
+            base=$(basename "$f")
+            # The builder rejects anything else, and a stray name would become
+            # a URL, so validate here as well.
+            if [[ ! $base =~ ^[A-Za-z0-9][A-Za-z0-9._+~-]*\.(deb|rpm)$ ]]; then
+              echo "::error::unexpected package filename: $base"
+              exit 1
+            fi
+            cp -f "$f" "out/$base"
+          done
+          ls -l out
+          echo "count=$(ls -1 out | wc -l)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify package metadata
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rpm >/dev/null
+          shopt -s nullglob
+          fail=0
+          for f in out/*.deb; do
+            name=$(dpkg-deb -f "$f" Package)
+            ver=$(dpkg-deb -f "$f" Version)
+            arch=$(dpkg-deb -f "$f" Architecture)
+            printf 'deb  %-32s %-24s %s\n' "$name" "$ver" "$arch"
+            case "$arch" in amd64|arm64|i386) ;; *) echo "::error::$f has unsupported arch $arch"; fail=1 ;; esac
+          done
+          for f in out/*.rpm; do
+            read -r name ver arch < <(rpm -qp --queryformat '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' "$f")
+            printf 'rpm  %-32s %-24s %s\n' "$name" "$ver" "$arch"
+            case "$arch" in x86_64|aarch64|i686|i386|noarch) ;; *) echo "::error::$f has unsupported arch $arch"; fail=1 ;; esac
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
+          # A version that does not derive from the tag never upgrades clients.
+          tag=${TAG#v}
+          for f in out/*.deb; do
+            v=$(dpkg-deb -f "$f" Version)
+            case "$v" in "$tag"|"$tag-"*|"$tag~"*|"$tag."*) ;;
+              *) echo "::warning::$f version '$v' does not match tag '$tag'" ;;
+            esac
+          done
+
+      - name: Publish to the repository
+        id: upload
+        env:
+          SSH_KEY: ${{ secrets.DL_SSH_KEY }}
+          SSH_HOST: ${{ secrets.DL_SSH_HOST }}
+          SSH_USER: ${{ secrets.DL_SSH_USER }}
+          SSH_PORT: ${{ secrets.DL_SSH_PORT || 22 }}
+          TIER: ${{ inputs.tier }}
+          REPO: ${{ inputs.repo || github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Job ids sort chronologically and keep concurrent runs apart.
+          slug=$(echo "${REPO##*/}" | tr -c 'A-Za-z0-9.-' '-')
+          id="$(date -u +%Y%m%dT%H%M%SZ)-${slug}-${GITHUB_RUN_ID}"
+          echo "job-id=$id" >> "$GITHUB_OUTPUT"
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/dl_key
+          chmod 600 ~/.ssh/dl_key
+          ssh-keygen -y -f ~/.ssh/dl_key >/dev/null   # fail early on a broken key
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          SSH_OPTS=(-i ~/.ssh/dl_key -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes)
+
+          ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "mkdir -p incoming/$id"
+
+          jq -n --arg repo "$REPO" --arg tag "$TAG" --arg tier "$TIER" \
+                --arg commit "$GITHUB_SHA" --arg actor "$GITHUB_ACTOR" \
+                --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{repo:$repo, tag:$tag, tier:$tier, commit:$commit, actor:$actor, run:$run}' > meta.json
+          : > READY
+
+          rsync -a -e "ssh ${SSH_OPTS[*]}" out/ "$SSH_USER@$SSH_HOST:incoming/$id/"
+          # READY last: the agent only picks up jobs that are complete.
+          rsync -a -e "ssh ${SSH_OPTS[*]}" meta.json READY "$SSH_USER@$SSH_HOST:incoming/$id/"
+
+          echo "waiting for the builder to apply job $id"
+          status=''
+          for _ in $(seq 1 120); do
+            status="$(ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "cat dl-inbox/status/$id.json" 2>/dev/null || true)"
+            case "$status" in *'"status"'*) break ;; esac
+            status=''
+            sleep 10
+          done
+          if [ -z "$status" ]; then
+            echo "::error::the builder did not finish job $id in time"
+            ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "cat dl-inbox/logs/$id.log" 2>/dev/null | tail -40 || true
+            exit 1
+          fi
+          echo "$status" | tee result.json
+          if [ "$(echo "$status" | jq -r .status)" != ok ]; then
+            echo "::error::the builder rejected job $id"
+            echo "$status" | jq -r '.message // empty'
+            exit 1
+          fi
+
+      - name: Verify the published repository
+        env:
+          BASE: ${{ inputs.dl-base-url }}
+          TIER: ${{ inputs.tier }}
+        run: |
+          set -euo pipefail
+          # Every package the builder reports must be fetchable, byte-for-byte.
+          # RPMs are re-signed with the repository key during ingest, so only
+          # debs are expected to be byte-identical to the uploaded asset.
+          while read -r pkg; do
+            url=$(echo "$pkg" | jq -r .url)
+            kind=$(echo "$pkg" | jq -r .kind)
+            want=$(echo "$pkg" | jq -r .sha256)
+            origin=$(echo "$pkg" | jq -r .origin_sha256)
+            got=$(curl -fsSL "$url" | sha256sum | awk '{print $1}')
+            if [ "$got" != "$want" ]; then
+              echo "::error::$url serves the wrong content ($got != $want)"
+              exit 1
+            fi
+            if [ "$kind" = deb ] && [ "$origin" != "$want" ]; then
+              echo "::error::$url was rewritten during ingest ($origin -> $want)"
+              exit 1
+            fi
+            echo "ok $url ($kind)"
+          done < <(jq -c '.packages[]' result.json)
+
+          # Clients refuse an unsigned tier, so assert the signature headers.
+          curl -fsSL "$BASE/$TIER/dists/bookworm/InRelease" -o inrelease
+          head -1 inrelease | grep -q 'BEGIN PGP SIGNED MESSAGE'
+          curl -fsSL "$BASE/$TIER/EL/9/x86_64/repodata/repomd.xml.asc" -o repomd.asc
+          grep -q 'BEGIN PGP SIGNATURE' repomd.asc
+          echo "tier metadata is present and signed"
+
+      - name: Install test (deb, debian:bookworm)
+        if: inputs.install-test
+        env:
+          BASE: ${{ inputs.dl-base-url }}
+          TIER: ${{ inputs.tier }}
+          PKG: ${{ inputs.install-package }}
+        run: |
+          set -euo pipefail
+          pkg=${PKG:-${GITHUB_REPOSITORY##*/}}
+          echo "installing $pkg from $BASE/$TIER (debian bookworm)"
+          docker run --rm -e PKG="$pkg" -e BASE="$BASE" -e TIER="$TIER" debian:bookworm bash -eu -c '
+            apt-get update -qq
+            apt-get install -y -qq ca-certificates curl gnupg >/dev/null
+            install -d /etc/apt/keyrings
+            curl -fsSL "$BASE/keys/pilab.gpg" -o /etc/apt/keyrings/pilab.gpg
+            echo "deb [signed-by=/etc/apt/keyrings/pilab.gpg] $BASE/$TIER bookworm main" > /etc/apt/sources.list.d/pilab.list
+            apt-get update -qq
+            # Dependency resolution plus a fetch from the signed repository is
+            # the part that proves the publish worked.
+            apt-get install -y --no-install-recommends --download-only "$PKG" >/dev/null
+            # Then unpack. Package postinst scripts routinely call systemctl,
+            # which cannot work in a container, so a configure failure is not a
+            # repository failure.
+            if ! apt-get install -y --no-install-recommends "$PKG"; then
+              echo "::warning::postinst failed (expected without systemd)"
+            fi
+            dpkg -s "$PKG" | grep -qE "^Status: install ok (installed|half-configured)"
+            dpkg -V "$PKG" && echo "installed files verify clean"
+          '
+
+      - name: Install test (rpm, almalinux:9)
+        if: inputs.install-test
+        env:
+          BASE: ${{ inputs.dl-base-url }}
+          TIER: ${{ inputs.tier }}
+          PKG: ${{ inputs.install-package }}
+        run: |
+          set -euo pipefail
+          pkg=${PKG:-${GITHUB_REPOSITORY##*/}}
+          echo "installing $pkg from $BASE/$TIER (almalinux 9)"
+          docker run --rm -e PKG="$pkg" -e BASE="$BASE" -e TIER="$TIER" almalinux:9 bash -eu -c '
+            curl -fsSL "$BASE/$TIER/EL/9/pilab.repo" -o /etc/yum.repos.d/pilab.repo
+            # rpm only imports armored keys, and pilab.repo points at pilab.asc
+            curl -fsSL "$BASE/keys/pilab.asc" -o /etc/pki/rpm-gpg/RPM-GPG-KEY-pilab
+            # repo_gpgcheck=1 means this fails outright if the metadata or the
+            # key are wrong; scriptlet errors are tolerated as above.
+            dnf -y install "$PKG" || echo "::warning::dnf reported scriptlet errors"
+            rpm -q "$PKG"
+            rpm -V "$PKG" && echo "installed files verify clean"
+          '
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### dl.pilab.hu sync"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| job | \`${{ steps.upload.outputs.job-id }}\` |"
+            echo "| tier | \`${{ inputs.tier }}\` |"
+            echo "| repo | \`${{ inputs.repo || github.repository }}\` |"
+            echo "| tag | \`${{ inputs.tag || github.ref_name }}\` |"
+            echo ""
+            echo "| package | published path |"
+            echo "|---|---|"
+            jq -r '.packages[]? | "| `\(.file)` | `\(.target)` |"' result.json 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
