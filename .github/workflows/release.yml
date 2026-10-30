@@ -71,6 +71,14 @@ on:
         description: 'Install the package from the published repository'
         type: boolean
         default: true
+      install-deb:
+        description: 'Run the Debian install test (disable when the project ships no deb)'
+        type: boolean
+        default: true
+      install-rpm:
+        description: 'Run the RPM install test (disable when dependencies do not resolve on EL9)'
+        type: boolean
+        default: true
       install-package:
         description: 'Package name for the install test. Defaults to the package input.'
         type: string
@@ -228,6 +236,8 @@ jobs:
       repo: ${{ github.repository }}
       tag: ${{ needs.goreleaser.outputs.tag }}
       install-test: ${{ inputs.install-test }}
+      install-deb: ${{ inputs.install-deb }}
+      install-rpm: ${{ inputs.install-rpm }}
       install-package: ${{ inputs.install-package || needs.goreleaser.outputs.package }}
     secrets:
       DL_SSH_KEY: ${{ secrets.DL_SSH_KEY }}

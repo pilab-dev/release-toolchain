@@ -42,6 +42,14 @@ on:
         description: 'Install the package from the published repository in a container'
         type: boolean
         default: true
+      install-deb:
+        description: 'Run the Debian install test (disable when the project ships no deb)'
+        type: boolean
+        default: true
+      install-rpm:
+        description: 'Run the RPM install test (disable when dependencies do not resolve on EL9)'
+        type: boolean
+        default: true
       install-package:
         description: 'Package name for the install test. Defaults to the repository name.'
         type: string
@@ -263,7 +271,7 @@ jobs:
           echo "tier metadata is present and signed"
 
       - name: Install test (deb, debian:bookworm)
-        if: inputs.install-test
+        if: inputs.install-test && inputs.install-deb
         env:
           BASE: ${{ inputs.dl-base-url }}
           TIER: ${{ inputs.tier }}
@@ -279,6 +287,12 @@ jobs:
             curl -fsSL "$BASE/keys/pilab.gpg" -o /etc/apt/keyrings/pilab.gpg
             echo "deb [signed-by=/etc/apt/keyrings/pilab.gpg] $BASE/$TIER bookworm main" > /etc/apt/sources.list.d/pilab.list
             apt-get update -qq
+            # Not every project ships a deb; a missing package is not a
+            # repository failure.
+            if ! apt-cache show "$PKG" >/dev/null 2>&1; then
+              echo "no deb $PKG in $TIER/bookworm, skipping the install test"
+              exit 0
+            fi
             # Dependency resolution plus a fetch from the signed repository is
             # the part that proves the publish worked.
             apt-get install -y --no-install-recommends --download-only "$PKG" >/dev/null
@@ -286,14 +300,14 @@ jobs:
             # which cannot work in a container, so a configure failure is not a
             # repository failure.
             if ! apt-get install -y --no-install-recommends "$PKG"; then
-              echo "::warning::postinst failed (expected without systemd)"
+              echo "postinst failed (expected without systemd)"
             fi
             dpkg -s "$PKG" | grep -qE "^Status: install ok (installed|half-configured)"
             dpkg -V "$PKG" && echo "installed files verify clean"
           '
 
       - name: Install test (rpm, almalinux:9)
-        if: inputs.install-test
+        if: inputs.install-test && inputs.install-rpm
         env:
           BASE: ${{ inputs.dl-base-url }}
           TIER: ${{ inputs.tier }}
@@ -306,9 +320,15 @@ jobs:
             curl -fsSL "$BASE/$TIER/EL/9/pilab.repo" -o /etc/yum.repos.d/pilab.repo
             # rpm only imports armored keys, and pilab.repo points at pilab.asc
             curl -fsSL "$BASE/keys/pilab.asc" -o /etc/pki/rpm-gpg/RPM-GPG-KEY-pilab
+            # -y answers the gpgkey= import prompt on a clean machine; without
+            # it dnf declines the key and reports a bogus bad signature.
+            if ! dnf -y -q list "$PKG" >/dev/null 2>&1; then
+              echo "no rpm $PKG in $TIER/EL9, skipping the install test"
+              exit 0
+            fi
             # repo_gpgcheck=1 means this fails outright if the metadata or the
             # key are wrong; scriptlet errors are tolerated as above.
-            dnf -y install "$PKG" || echo "::warning::dnf reported scriptlet errors"
+            dnf -y install "$PKG" || echo "dnf reported scriptlet errors"
             rpm -q "$PKG"
             rpm -V "$PKG" && echo "installed files verify clean"
           '

@@ -61,6 +61,8 @@ Inputs (all optional except `description` in practice):
 | `tier` | `testing` | `testing` or `stable` |
 | `sync` | `true` | publish to dl.pilab.hu |
 | `install-test` | `true` | install from the published repo in a container |
+| `install-deb` | `true` | run the Debian install test (skip for rpm-only projects) |
+| `install-rpm` | `true` | run the RPM install test (skip when deps do not resolve on EL9) |
 | `install-package` | `package` | package to install when the name differs |
 | `toolchain-ref` | `v1` | ref of this repo used to render the template |
 
