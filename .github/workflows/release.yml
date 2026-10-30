@@ -211,14 +211,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Best effort: publishing reads the assets off the release this run just
+      # created, so an exhausted artifact storage quota must never block it.
       - name: Upload packages
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: packages
           path: |
             dist/*.deb
             dist/*.rpm
-          if-no-files-found: error
+          if-no-files-found: warn
 
   sync:
     name: publish
@@ -230,8 +233,9 @@ jobs:
     # @ref this workflow itself is called at and with toolchain-ref.
     uses: pilab-dev/release-toolchain/.github/workflows/sync-dl.yml@v1
     with:
-      source: artifact
-      artifact-name: packages
+      # Straight off the release this run just created: no artifact hand-off,
+      # so publishing keeps working when Actions artifact storage is full.
+      source: release
       tier: ${{ inputs.tier }}
       repo: ${{ github.repository }}
       tag: ${{ needs.goreleaser.outputs.tag }}

@@ -23,7 +23,7 @@ on:
         type: string
         default: ''
       artifact-name:
-        description: 'Artifact holding the packages (source=artifact)'
+        description: 'Artifact glob to download (source=artifact): download-artifact `pattern`, merged into one directory'
         type: string
         default: packages
       tier:
@@ -117,8 +117,11 @@ jobs:
         if: inputs.source == 'artifact'
         uses: actions/download-artifact@v4
         with:
-          name: ${{ inputs.artifact-name }}
+          # A glob, so a caller can merge several uploads (firefighter keeps
+          # debs and rpms in separate artifacts).
+          pattern: ${{ inputs.artifact-name }}
           path: pkgs
+          merge-multiple: true
 
       - name: Check packages
         id: check
