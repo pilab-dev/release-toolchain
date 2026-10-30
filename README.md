@@ -84,6 +84,41 @@ For a repository that already builds its own packages:
 `source: release` pulls `.deb`/`.rpm` assets off the GitHub release by tag;
 `source: artifact` uses an artifact named `packages` uploaded by an earlier job.
 
+To publish an existing release by hand, give the consumer repository the
+`publish-dl.yml` shown below — the button then lives in that repository's
+Actions tab and can read its (possibly private) releases.
+
+### `publish-dl.yml` — a publish button for the consumer repository
+
+Add this file to a product repository to publish an existing release by hand
+(the button appears in that repository's Actions tab, and it can read that
+repository's private releases):
+
+```yaml
+name: publish-dl
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish'
+        type: string
+        required: true
+      tier:
+        description: 'testing or stable'
+        type: string
+        default: testing
+
+jobs:
+  publish:
+    uses: pilab-dev/release-toolchain/.github/workflows/sync-dl.yml@v1
+    with:
+      source: release
+      tag: ${{ inputs.tag }}
+      tier: ${{ inputs.tier }}
+    secrets: inherit
+```
+
 ### `promote-dl.yml` — testing → stable
 
 ```yaml

@@ -42,6 +42,27 @@ on:
       DL_SSH_PORT:
         required: false
 
+  # Promote by hand from the Actions tab: Actions → promote-dl → Run workflow.
+  # Secrets come from this repository instead of a caller.
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Package name to promote'
+        type: string
+        required: true
+      type:
+        description: 'deb or rpm'
+        type: string
+        default: deb
+      from:
+        description: 'Source tier'
+        type: string
+        default: testing
+      to:
+        description: 'Target tier'
+        type: string
+        default: stable
+
 permissions:
   contents: read
 
