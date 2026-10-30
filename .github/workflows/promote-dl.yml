@@ -60,6 +60,8 @@ jobs:
           FROM: ${{ inputs.from }}
           TO: ${{ inputs.to }}
         run: |
+          # The remote status command is built from $id on this side on
+          # purpose: the request id selects the file on the builder.
           set -euo pipefail
           case "$TYPE" in deb|rpm) ;; *) echo "::error::invalid type $TYPE"; exit 1 ;; esac
           case "$FROM$TO" in
@@ -83,6 +85,7 @@ jobs:
           rsync -a -e "ssh ${SSH_OPTS[*]}" "req/$id.json" "$SSH_USER@$SSH_HOST:requests/$id.json"
 
           for _ in $(seq 1 90); do
+            # shellcheck disable=SC2029
             out="$(ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "cat dl-inbox/status/$id.json" 2>/dev/null || true)"
             case "$out" in *'"status"'*) break ;; esac
             out=''

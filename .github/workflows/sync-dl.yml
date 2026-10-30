@@ -134,7 +134,7 @@ jobs:
             cp -f "$f" "out/$base"
           done
           ls -l out
-          echo "count=$(ls -1 out | wc -l)" >> "$GITHUB_OUTPUT"
+          echo "count=$(find out -mindepth 1 -maxdepth 1 -type f | wc -l)" >> "$GITHUB_OUTPUT"
 
       - name: Verify package metadata
         env:
@@ -179,6 +179,8 @@ jobs:
           REPO: ${{ inputs.repo || github.repository }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          # Remote commands are built from $id on this side on purpose: the job
+          # id is what selects the file on the builder, so expand it locally.
           set -euo pipefail
           # Job ids sort chronologically and keep concurrent runs apart.
           slug=$(echo "${REPO##*/}" | tr -c 'A-Za-z0-9.-' '-')
@@ -192,6 +194,7 @@ jobs:
           ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
           SSH_OPTS=(-i ~/.ssh/dl_key -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes)
 
+          # shellcheck disable=SC2029
           ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "mkdir -p incoming/$id"
 
           jq -n --arg repo "$REPO" --arg tag "$TAG" --arg tier "$TIER" \
@@ -207,6 +210,7 @@ jobs:
           echo "waiting for the builder to apply job $id"
           status=''
           for _ in $(seq 1 120); do
+            # shellcheck disable=SC2029
             status="$(ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "cat dl-inbox/status/$id.json" 2>/dev/null || true)"
             case "$status" in *'"status"'*) break ;; esac
             status=''
@@ -214,6 +218,7 @@ jobs:
           done
           if [ -z "$status" ]; then
             echo "::error::the builder did not finish job $id in time"
+            # shellcheck disable=SC2029
             ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "cat dl-inbox/logs/$id.log" 2>/dev/null | tail -40 || true
             exit 1
           fi
